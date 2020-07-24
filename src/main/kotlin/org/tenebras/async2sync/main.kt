@@ -22,19 +22,17 @@ fun main() {
         if (vertxResult.succeeded()) {
             val vertx = vertxResult.result()
             val eventBus = vertx.eventBus()
-
-
             val router = RouterImpl(vertx)
             val clusterManager = (vertx as VertxImpl).clusterManager as HazelcastClusterManager
 
             // fixme: blocking call
-            val processesSet = clusterManager.hazelcastInstance.getSet<String>("waiting")
+            val waitingRequests = clusterManager.hazelcastInstance.getSet<String>("waiting")
 
             router.get("/callback").handler { ctx ->
                 val id = ctx.queryParam("id").first()
                 val value = ctx.queryParam("value").first()
 
-                if (processesSet.contains(id)) {
+                if (waitingRequests.contains(id)) {
                     eventBus.request<String>("hello.$id", value) {
                         ctx.response().end(it.result().body())
                     }
@@ -43,39 +41,41 @@ fun main() {
                 }
             }
 
-            router.get("/hello")
-                .handler { ctx ->
-                    val id = ctx.queryParam("id").first()
-                    val consumer = eventBus.consumer<String>("hello.$id")
+            router.get("/hello").handler { ctx ->
+                val id = ctx.queryParam("id").first()
+                val consumer = eventBus.consumer<String>("hello.$id")
+                // fixme: blocking call
+                waitingRequests.add(id)
+
+                consumer.handler {
+                    println("Received response for $id")
+                    ctx.response().end("Hello, ${it.body()}")
+                    it.reply("sent")
                     // fixme: blocking call
-                    processesSet.add(id)
-
-                    consumer.handler {
-                        println("Received response for $id")
-                        ctx.response().end("Hello, ${it.body()}")
-                        it.reply("sent")
-                        // fixme: blocking call
-                        processesSet.remove(id)
-                        consumer.unregister()
-                    }
-
-                    ctx.vertx().setTimer(10000) {
-                        consumer.unregister()
-                        // fixme: blocking call
-                        processesSet.remove(id)
-                        ctx.fail(HttpResponseStatus.GATEWAY_TIMEOUT.code())
-                    }
+                    waitingRequests.remove(id)
+                    consumer.unregister()
                 }
 
-            router.get("/status").handler { ctx ->
-                val status = mapOf(
-                    "nodes" to clusterManager.nodes,
-                    "idsWaitingForResponse" to processesSet
-                )
+                ctx.vertx().setTimer(10000) {
+                    consumer.unregister()
+                    // fixme: blocking call
+                    waitingRequests.remove(id)
+                    ctx.fail(HttpResponseStatus.GATEWAY_TIMEOUT.code())
+                }
+            }
 
-                ctx.response()
+            router.get("/status").handler { ctx ->
+                ctx
+                    .response()
                     .putHeader("Content-Type", "application/json")
-                    .end(ObjectMapper().writeValueAsString(status))
+                    .end(
+                        ObjectMapper().writeValueAsString(
+                            mapOf(
+                                "nodes" to clusterManager.nodes,
+                                "idsWaitingForResponse" to waitingRequests
+                            )
+                        )
+                    )
             }
 
             GlobalScope.launch(vertx.dispatcher()) {
